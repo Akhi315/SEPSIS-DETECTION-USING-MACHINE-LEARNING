@@ -1,0 +1,142 @@
+# train_models_esp32.py
+import json, pickle
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import f1_score, average_precision_score
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
+
+# Optional: SMOTE for imbalance (requires imbalanced-learn)
+USE_SMOTE = False
+IMB_AVAILABLE = False
+if USE_SMOTE:
+    try:
+        from imblearn.over_sampling import SMOTE
+        from imblearn.pipeline import Pipeline as ImbPipeline
+        IMB_AVAILABLE = True
+    except Exception:
+        print("imbalanced-learn not available; proceeding without SMOTE")
+        USE_SMOTE = False
+
+# -------- 1) Load CSV with diagnostics --------
+DATA = "synthetic_sepsis_esp32.csv"
+p = Path(DATA)
+if not p.exists():
+    raise FileNotFoundError(f"Dataset not found at: {p.resolve()}")  # ensures path is correct
+
+df = pd.read_csv(p)
+print("Raw shape:", df.shape)
+print("Raw columns:", list(df.columns))
+
+# Try mapping common alternative headers to required names
+required = ["Age","Sex","Heart_Rate","SpO2","Body_Temperature","Respiratory_Rate","Sepsis_Label"]
+alt_maps = [
+    {"Age":"Age","Sex":"Sex","Heart_Rate":"Heart_Rate","SpO2":"SpO2","Body_Temperature":"Body_Temperature","Respiratory_Rate":"Respiratory_Rate","Sepsis_Label":"Sepsis_Label"},
+    {"Age":"age","Sex":"sex","Heart_Rate":"HR","SpO2":"O2Sat","Body_Temperature":"Temp","Respiratory_Rate":"Resp","Sepsis_Label":"SepsisLabel"},
+]
+
+mapped = False
+for m in alt_maps:
+    if all(src in df.columns for src in m.values()):
+        inv = {src: dst for dst, src in m.items()}
+        df = df.rename(columns=inv)
+        mapped = True
+        break
+if not mapped:
+    missing = [c for c in required if c not in df.columns]
+    raise ValueError(f"Missing required columns: {missing}. Rename your headers or extend alt_maps.")  # prevents empty set [web:124]
+
+# Handle Sex if it’s strings
+if df["Sex"].dtype == object:
+    df["Sex"] = df["Sex"].str.strip().str.lower().map({"male":1,"m":1,"female":0,"f":0})
+
+# Coerce to numeric; do not drop yet to avoid wiping the dataset
+for c in required:
+    df[c] = pd.to_numeric(df[c], errors="coerce")
+
+print("NaN counts before filtering:", df[required].isna().sum().to_dict())
+
+# Keep rows with at least 6 of 7 present and require label
+df = df[df[required].notna().sum(axis=1) >= 6]
+df = df.dropna(subset=["Sepsis_Label"])
+df["Sepsis_Label"] = df["Sepsis_Label"].astype(int)
+print("Post filter shape:", df.shape)
+if len(df) == 0:
+    raise ValueError("No rows remain after flexible filtering; inspect CSV, header names, and value formats.")  # avoids n_samples=0 [web:124]
+
+# Features/labels
+feature_order = ["Age","Sex","Heart_Rate","SpO2","Body_Temperature","Respiratory_Rate"]
+X = df[feature_order].values
+y = df["Sepsis_Label"].values
+
+# Stratified split to preserve class balance
+X_train, X_val, y_train, y_val = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+print("Train/Val sizes:", X_train.shape, X_val.shape)
+print("Class balance (train):", {int(k):int(v) for k,v in pd.Series(y_train).value_counts().items()})
+print("Class balance (val):", {int(k):int(v) for k,v in pd.Series(y_val).value_counts().items()})
+
+# -------- 2) Build calibrated pipelines (valid order) --------
+def make_pipeline(base_est):
+    # Final step is calibrated classifier; imputer+scaler are transformers before it
+    cal = CalibratedClassifierCV(base_est, method="isotonic", cv=3)
+    steps = []
+    pipe_cls = Pipeline
+    if USE_SMOTE and IMB_AVAILABLE:
+        steps.append(("smote", SMOTE(random_state=42)))
+        pipe_cls = ImbPipeline  # required when using samplers [web:115]
+    steps += [
+        ("imputer", SimpleImputer(strategy="median")),  # handle remaining NaNs inside pipeline [web:96]
+        ("scaler", StandardScaler()),
+        ("cal", cal)  # final estimator (meta-estimator) [web:22]
+    ]
+    return pipe_cls(steps)
+
+estimators = {
+    "Logistic_Regression": LogisticRegression(max_iter=1000, class_weight="balanced"),
+    "Decision_Tree": DecisionTreeClassifier(random_state=42),
+    "Random_Forest": RandomForestClassifier(n_estimators=300, random_state=42, class_weight="balanced_subsample"),
+    "SVM": SVC(kernel="rbf", probability=True, random_state=42, class_weight="balanced"),
+    "KNN": KNeighborsClassifier(n_neighbors=5)
+}
+
+thresholds, metrics = {}, {}
+
+for name, base in estimators.items():
+    print(f"Training {name}...")
+    pipe = make_pipeline(base)
+    pipe.fit(X_train, y_train)
+
+    # Probability outputs and threshold tuning via F1 on validation
+    val_probs = pipe.predict_proba(X_val)[:, 1]
+    grid = np.linspace(0.05, 0.95, 181)
+    f1s = [f1_score(y_val, (val_probs >= t).astype(int)) for t in grid]
+    best_idx = int(np.argmax(f1s))
+    best_t = float(grid[best_idx])
+    ap = float(average_precision_score(y_val, val_probs))
+
+    with open(f"{name}_calibrated_pipeline.pkl", "wb") as f:
+        pickle.dump(pipe, f)
+
+    thresholds[name] = best_t
+    metrics[name] = {"AP": ap, "best_F1": float(f1s[best_idx]), "thr": best_t}
+    print(f"{name}: AP={ap:.3f} | best F1={f1s[best_idx]:.3f} @ thr={best_t:.2f}")
+
+# Save thresholds and feature order for Flask
+with open("thresholds.json", "w") as f:
+    json.dump({"thresholds": thresholds, "feature_order": feature_order, "metrics": metrics}, f, indent=2)
+
+print("Saved calibrated pipelines and thresholds.")

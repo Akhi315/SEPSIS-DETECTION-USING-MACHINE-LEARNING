@@ -1,0 +1,108 @@
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Wire.h>
+#include <MAX30105.h>  // Include the MAX30105 sensor library
+
+// Temperature sensor setup
+#define ONE_WIRE_BUS 4
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+// MAX30105 setup for heart rate and SpO2
+MAX30105 particleSensor;  // Create an instance of the MAX30105 sensor
+const int numReadings = 10;  // Number of readings for moving average
+float heartRateReadings[numReadings];  // Array for heart rate readings
+float spO2Readings[numReadings];  // Array for SpO2 readings
+float totalHeartRate = 0;  // Total heart rate for moving average
+float totalSpO2 = 0;  // Total SpO2 for moving average
+int bufferIndex = 0;  // Index for buffer array
+unsigned long previousMillis = 0;  // Store last display time
+const unsigned long interval = 2000;  // 2-second display interval (2 seconds)
+
+void addToBuffer(float &total, float buffer[], float newValue) {
+  total -= buffer[bufferIndex];  // Subtract the oldest value
+  buffer[bufferIndex] = newValue;  // Add the new value
+  total += newValue;  // Update the total
+  bufferIndex = (bufferIndex + 1) % numReadings;  // Update buffer index
+}
+
+float getAverage(float total) {
+  return total / numReadings;  // Return average of readings
+}
+
+void setup() {
+  Serial.begin(115200);  // Start serial communication at 115200 baud
+  sensors.begin();  // Start the DS18B20 sensor
+
+  Serial.println("Initializing sensors...");
+
+  // Initialize MAX30105 sensor
+  if (!particleSensor.begin()) {
+    Serial.println("MAX30105 not found. Check wiring/power.");
+    while (1);  // Stop if the sensor is not found
+  }
+  particleSensor.setup();  // Initialize the sensor with default settings
+  Serial.println("Sensors Initialized.");
+}
+
+void loop() {
+  // Temperature sensor readings
+  sensors.requestTemperatures();
+  float temperature = sensors.getTempCByIndex(0);  // Get the temperature in Celsius
+  
+  if (temperature == DEVICE_DISCONNECTED_C) {
+    Serial.println("Error: Sensor not connected");
+  } else {
+    Serial.print("Current Temperature: ");
+    Serial.print(temperature);
+    Serial.println(" °C");
+  }
+
+  // Heart rate and SpO2 sensor readings
+  long ir = particleSensor.getIR();  // Get the IR value from the sensor
+
+  if (ir > 70000) {  // Check if a finger is detected
+    float red = particleSensor.getRed();  // Get red light data for SpO₂ calculation
+
+    // Placeholder for raw heart rate
+    float rawHeartRate = calculateHeartRate(ir); 
+    float systemSpO2 = calculateSpO2(red, ir); 
+
+    // Calibrate heart rate using known linear calibration
+    float calibratedHeartRate = 1.37 * rawHeartRate + 23.04;
+
+    // Add readings to buffer
+    addToBuffer(totalHeartRate, heartRateReadings, calibratedHeartRate);
+    addToBuffer(totalSpO2, spO2Readings, systemSpO2);
+  } else {
+    Serial.println("Finger not detected. Place your finger correctly.");
+  }
+
+  // Display heart rate and SpO2 readings every 2 seconds
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+
+    // Calculate and display averages
+    float avgHeartRate = getAverage(totalHeartRate);
+    float avgSpO2 = getAverage(totalSpO2);
+
+    Serial.print("Heart Rate: ");
+    Serial.print(avgHeartRate, 2);
+    Serial.print(" bpm, SpO₂: ");
+    Serial.print(avgSpO2, 2);
+    Serial.println(" %");
+  }
+
+  delay(5000);  // Wait for 5 seconds before reading again
+}
+
+// Replace this dummy implementation
+float calculateHeartRate(long ir) {
+  return 75.0 + (ir % 10);  // Example calculation
+}
+
+// Replace with SpO₂ library-based or calculations
+float calculateSpO2(float red, long ir) {
+  return 95.0;  // Replace with a real algorithm
+}

@@ -1,0 +1,145 @@
+# app.py
+from flask import Flask, render_template, request, jsonify
+import pickle, json
+import numpy as np
+from pathlib import Path
+
+app = Flask(__name__)
+
+MODEL_NAMES = ["Logistic_Regression","Random_Forest","Decision_Tree","SVM","KNN"]
+models = {}
+for name in MODEL_NAMES:
+    p = Path(f"{name}_calibrated_pipeline.pkl")
+    if p.exists():
+        with open(p, "rb") as f:
+            models[name] = pickle.load(f)
+
+with open("thresholds.json", "r") as f:
+    meta = json.load(f)
+THRESHOLDS = meta["thresholds"]
+FEATURE_ORDER = meta["feature_order"]
+
+latest_sensor_data = {
+    "Heart_Rate": 0.0,
+    "SpO2": 0.0,
+    "Body_Temperature": 0.0,
+    "Respiratory_Rate": 0.0
+}
+
+def clamp_float(value, lo, hi):
+    try:
+        x = float(value)
+    except:
+        return None
+    return min(max(x, lo), hi)
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    prediction_results, final_prediction, final_risk = {}, None, None
+    notice = None
+
+    if request.method == "POST":
+        mode = request.form.get("mode", "manual")
+
+        def getv(field, key):
+            raw = request.form.get(field, "")
+            if mode == "live" and (raw.strip() == "" or raw.strip().lower() == "auto"):
+                return float(latest_sensor_data[key] or 0.0)
+            return float(raw or 0.0)
+
+        Age = float(request.form.get("Age", 0))
+        Sex = 1 if request.form.get("Sex", "Male") == "Male" else 0
+        Heart_Rate = getv("Heart_Rate", "Heart_Rate")
+        SpO2 = getv("SpO2", "SpO2")
+        Body_Temperature = getv("Body_Temperature", "Body_Temperature")
+        Respiratory_Rate = getv("Respiratory_Rate", "Respiratory_Rate")
+
+        # Plausibility clamp to prevent out-of-distribution spikes
+        hr_c   = clamp_float(Heart_Rate,       40, 200)   # bpm
+        spo2_c = clamp_float(SpO2,              80, 100)  # %
+        temp_c = clamp_float(Body_Temperature,  34.5, 41.0) # °C
+        rr_c   = clamp_float(Respiratory_Rate,   6, 45)   # /min
+
+        if None in (hr_c, spo2_c, temp_c, rr_c):
+            notice = "Please enter valid numeric vitals."
+            return render_template("form.html",
+                                   prediction_results={"Notice": notice},
+                                   final_prediction=None,
+                                   final_risk=None,
+                                   sensor_data=latest_sensor_data)
+
+        # If any clamping occurred, optionally inform user (non-blocking)
+        if (hr_c != Heart_Rate) or (spo2_c != SpO2) or (temp_c != Body_Temperature) or (rr_c != Respiratory_Rate):
+            notice = "Values adjusted to plausible ranges to ensure reliable predictions."
+
+        feats = np.array([[Age, Sex, hr_c, spo2_c, temp_c, rr_c]], dtype=float)
+
+        selected = [m for m in request.form.getlist("models") if m.replace(" ", "_") in models]
+
+        probs, thrs, keys = [], [], []
+        for ui_name in selected:
+            key = ui_name.replace(" ", "_")
+            mdl = models[key]
+            p = float(mdl.predict_proba(feats)[:, 1][0])
+            thr = float(THRESHOLDS.get(key, 0.5))
+            probs.append(p); thrs.append(thr); keys.append(key)
+            prediction_results[ui_name] = "✅ No Sepsis" if p < thr else "🚨 Sepsis Detected"
+
+        if probs:
+            # Outlier-robust ensemble: drop a single strong outlier (>0.15 away from mean)
+            mean_p = float(np.mean(probs))
+            diffs = [abs(p - mean_p) for p in probs]
+            out_idx = int(np.argmax(diffs)) if diffs else -1
+
+            if len(probs) >= 3 and out_idx >= 0 and diffs[out_idx] > 0.15:
+                probs_robust = [p for i, p in enumerate(probs) if i != out_idx]
+                thrs_robust  = [t for i, t in enumerate(thrs)  if i != out_idx]
+                mean_p = float(np.mean(probs_robust))
+                mean_thr = float(np.mean(thrs_robust))
+            else:
+                mean_thr = float(np.mean(thrs))
+
+            # Optional: require at least 2 positive models OR mean above threshold
+            positives = sum(int(p >= t) for p, t in zip(probs, thrs))
+            if positives >= 2 or mean_p >= mean_thr:
+                final_prediction = "🚨 Sepsis Detected"
+            else:
+                final_prediction = "✅ No Sepsis"
+
+            # You removed risk text from UI; keep for debugging if needed
+            final_risk = None
+
+    return render_template("form.html",
+                           prediction_results=prediction_results,
+                           final_prediction=final_prediction,
+                           final_risk=final_risk,
+                           sensor_data=latest_sensor_data)
+
+@app.route("/data", methods=["POST"])
+@app.route("/upload", methods=["POST"])
+def receive_data():
+    try:
+        data = request.get_json(force=True)
+        if not data:
+            return jsonify({"status": "error", "message": "No JSON"}), 400
+
+        hr = data.get("heartRate") or data.get("heart_rate") or data.get("HR") or data.get("Heart_Rate")
+        spo2 = data.get("spo2") or data.get("SpO2")
+        temp = data.get("temperature") or data.get("temp") or data.get("Body_Temperature")
+        rr = data.get("respiratoryRate") or data.get("respiratory_rate") or data.get("Respiratory_Rate")
+
+        if hr is not None: latest_sensor_data["Heart_Rate"] = float(hr)
+        if spo2 is not None: latest_sensor_data["SpO2"] = float(spo2)
+        if temp is not None: latest_sensor_data["Body_Temperature"] = float(temp)
+        if rr is not None: latest_sensor_data["Respiratory_Rate"] = float(rr)
+
+        return jsonify({"status": "success"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route("/latest", methods=["GET"])
+def latest():
+    return jsonify(latest_sensor_data)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)

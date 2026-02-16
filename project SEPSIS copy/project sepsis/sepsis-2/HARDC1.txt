@@ -1,0 +1,99 @@
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Wire.h>
+#include "MAX30105.h"
+
+// Pin where the DS18B20 data pin is connected
+#define ONE_WIRE_BUS 4
+
+// Setup a oneWire instance to communicate with any OneWire device
+OneWire oneWire(ONE_WIRE_BUS);
+
+// Pass our oneWire reference to Dallas Temperature library
+DallasTemperature sensors(&oneWire);
+
+// Calibration factor (calculated from the difference)
+float calibrationFactor = 0.785; // add 0.785°C to calibrate
+
+MAX30105 particleSensor;
+
+#define debug Serial
+
+// Coefficients for linear regression equations (update with actual values)
+#define HR_COEFF_RED 2.6574e-05   // Coefficient for R in heart rate equation
+#define HR_COEFF_IR 2.5909e-04    // Coefficient for IR in heart rate equation
+#define HR_OFFSET 47.42           // Offset for heart rate equation
+
+#define SPO2_COEFF_RED 6.9844e-07 // Coefficient for R in SpO2 equation
+#define SPO2_COEFF_IR -6.1744e-06 // Coefficient for IR in SpO2 equation
+#define SPO2_OFFSET 96.63         // Offset for SpO2 equation
+
+#define IR_THRESHOLD 70000        // Threshold for IR value to detect a finger
+
+void setup() {
+  // Start the Serial Monitor at 115200 baud for temperature sensor data
+  Serial.begin(115200);
+  Serial.println("Initializing DS18B20 and MAX30105 Sensors...");
+
+  // Initialize the DS18B20 temperature sensor
+  sensors.begin();
+
+  // Initialize MAX30105 SpO2 sensor
+  debug.begin(9600);  // Start communication with MAX30105 sensor at 9600 baud
+  if (particleSensor.begin() == false) {
+    debug.println("MAX30105 was not found. Please check wiring/power.");
+    while (1);
+  }
+  particleSensor.setup(); // Configure sensor
+}
+
+void loop() {
+  // --- Temperature Sensor Data ---
+  sensors.requestTemperatures();
+  float tempC = sensors.getTempCByIndex(0);
+  if (tempC == DEVICE_DISCONNECTED_C) {
+    Serial.println("Error: Could not read temperature data");
+  } else {
+    tempC += calibrationFactor;
+    Serial.print("Temperature: ");
+    Serial.print(tempC);
+    Serial.println(" °C");
+  }
+
+  // --- SpO2 Sensor Data ---
+  debug.begin(9600);  // Switch to 9600 baud for the SpO2 sensor
+  // Get raw sensor readings
+  float red = particleSensor.getRed();
+  float ir = particleSensor.getIR();
+
+  // Check if a finger is detected
+  if (ir > IR_THRESHOLD) {
+    debug.println("Vital Readings");
+
+    // Calculate Heart Rate (HR) using the regression equation
+    float heartRate = (HR_COEFF_RED * red) + (HR_COEFF_IR * ir) + HR_OFFSET;
+
+    // Calculate SpO2 using the regression equation
+    float spO2 = (SPO2_COEFF_RED * red) + (SPO2_COEFF_IR * ir) + SPO2_OFFSET;
+    
+    // Calculate respiratory rate as 1/4 of heart rate
+    float respiratoryRate = (heartRate / 4.0) - 2;
+
+    // Print raw readings and calculated HR and SpO2
+    debug.print("Heart Rate: ");
+    debug.print(heartRate, 2); // Print HR with 2 decimal points
+    debug.print(" bpm ");
+    debug.print("SpO2: ");
+    debug.print(spO2, 2); // Print SpO2 with 2 decimal points
+    debug.println(" %");
+    
+    debug.print("Respiratory Rate: ");
+    debug.print(respiratoryRate, 2);
+    debug.println(" breaths/min");
+
+  } else {
+    debug.println("Finger not detected. Please place your finger on the sensor.");
+  }
+
+  delay(2000); // Delay for 1 second before the next reading
+}
