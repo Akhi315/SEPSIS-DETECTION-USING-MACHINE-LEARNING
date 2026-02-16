@@ -1,0 +1,43 @@
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// Pin where the DS18B20 data pin is connected
+#define ONE_WIRE_BUS 4
+
+// Setup a oneWire instance to communicate with any OneWire device
+OneWire oneWire(ONE_WIRE_BUS);
+
+// Pass our oneWire reference to Dallas Temperature library
+DallasTemperature sensors(&oneWire);
+
+// Calibration factor (calculated from the difference)
+float calibrationFactor = 0.785; // add 0.785°C to calibrate
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Initializing DS18B20 Sensor...");
+  
+  // Start the sensor
+  sensors.begin();
+}
+
+void loop() {
+  // Request temperature data from the sensor
+  sensors.requestTemperatures();
+  
+  // Fetch and print temperature in Celsius
+  float tempC = sensors.getTempCByIndex(0);
+  if (tempC == DEVICE_DISCONNECTED_C) {
+    Serial.println("Error: Could not read temperature data");
+  } else {
+    // Apply calibration factor
+    tempC += calibrationFactor;
+    
+    // Print calibrated temperature
+    Serial.print("Calibrated Temperature: ");
+    Serial.print(tempC);
+    Serial.println(" °C");
+  }
+  
+  delay(2000); // Read temperature every 2 seconds
+}
